@@ -1,17 +1,6 @@
 /**
- * Context management for Copilot API payloads.
- *
- * Enforces TWO ceilings, whichever is smaller for a given model:
- *   1. Hard byte ceiling (~5 MB) — Copilot's Azure Front Door cliff
- *   2. Token-derived byte ceiling — model's max_prompt_tokens × 3.5 chars
- *
- * The token-derived ceiling prevents `model_max_prompt_tokens_exceeded`
- * rejections on models with stricter caps (e.g. opus-4.7 = 168K tokens),
- * which a 1 MB payload can easily breach.
- *
- * Fast path (~99% of Claude Code requests): byte size check → return.
- * Slow path: prune tool outputs → strip images → drop oldest messages →
- *           byte-based final backstop.
+ * Chat history is preserved by default. Oversized payloads return a prompt-too-long
+ * error so the client can compact. Lossy byte/token-based reduction is opt-in.
  */
 
 import consola from "consola"
@@ -23,35 +12,13 @@ import type {
 import type { Model } from "~/services/copilot/get-models"
 
 import { getKnownModelPromptLimit } from "./model-limits"
+import { createPromptTooLongError } from "./prompt-too-long"
+import { state } from "./state"
 
 // ── Configuration ───────────────────────────────────────────────────────────
 
-/**
- * Hard byte ceiling for Copilot. Empirically the cliff is at ~5.4 MB for
- * Azure Front Door; we set the proxy ceiling at 5,000,000 to leave ~400 KB
- * headroom for headers, tool definitions, and downstream JSON framing.
- *
- * Why 5 MB and not 2.5 MB (v0.9.1-v0.10.2 value):
- *   The 2.5 MB ceiling fired aggressively on normal Claude Code sessions
- *   (typical 6 MB → 0.9 MB prune per turn). The pruned payload causes
- *   Copilot to report a small prompt_tokens count, which Claude Code uses
- *   to compute its local context estimate via tokenCountWithEstimation.
- *   Because Claude Code's local message array still holds the full unpruned
- *   conversation, its local count climbs by the rough delta each turn until
- *   it hits the blocking limit (window - 3K) and Claude Code emits
- *   "Context limit reached" via the preempt path in query.ts:641 — without
- *   ever calling our proxy, so auto-compact never fires.
- *
- *   Raising the ceiling to 5 MB lets normal payloads pass through unmodified.
- *   Copilot then returns honest prompt_tokens, and Claude Code's auto-compact
- *   threshold (window - 13K) trips on schedule. Pruning still kicks in as a
- *   last-resort safety net for genuinely oversized payloads (≥5 MB), which
- *   is rare in normal Claude Code use.
- *
- *   This restores the v0.8.0 behavior (no proxy-side context manager) which
- *   the user reports worked reliably for auto-compact.
- */
-const MAX_PAYLOAD_BYTES = 5_000_000
+/** Existing transport backstop; distinct from upstream token limits. */
+export const MAX_PAYLOAD_BYTES = 5_000_000
 
 /** Conservative ceiling for custom Claude Code aliases / effort modes that do
  *  not appear in Copilot model metadata. Copilot can hang for minutes in the
@@ -93,24 +60,7 @@ const IMAGE_STRIPPED_PLACEHOLDER = "[image removed to save context]"
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
-/**
- * Compute the effective byte ceiling for a given model.
- *
- * The proxy enforces TWO ceilings and uses whichever is smaller:
- *
- *   1. The hard byte ceiling MAX_PAYLOAD_BYTES (~5 MB) — Copilot's Azure
- *      Front Door rejects payloads >5.4 MB regardless of token count.
- *
- *   2. A token-derived byte ceiling — Copilot ALSO rejects when the
- *      tokenized prompt exceeds the model's `max_prompt_tokens` cap, which
- *      varies per model (e.g. claude-opus-4.7 = 168K, others = 200K). A 1 MB
- *      payload on opus-4.7 can easily contain 169K tokens and get rejected
- *      with `model_max_prompt_tokens_exceeded`. To prevent that, we estimate
- *      a byte budget from the token cap using a fixed chars/token ratio.
- *
- * If `max_prompt_tokens` is missing from model metadata, we fall back to
- * MAX_PAYLOAD_BYTES alone (existing behavior, no regression).
- */
+/** Legacy token-derived budget, used only for opt-in trimming. */
 function computeEffectiveCeiling(model: Model): number {
   const maxPromptTokens = getKnownModelPromptLimit(
     model.id,
@@ -120,7 +70,7 @@ function computeEffectiveCeiling(model: Model): number {
   const tokenDerivedBytes = Math.floor(
     (maxPromptTokens - TOKEN_RESERVE) * CHARS_PER_TOKEN_ESTIMATE,
   )
-  return Math.min(MAX_PAYLOAD_BYTES, tokenDerivedBytes)
+  return Math.max(1, Math.min(MAX_PAYLOAD_BYTES, tokenDerivedBytes))
 }
 
 /**
@@ -131,7 +81,8 @@ export function fitContext(
   payload: ChatCompletionsPayload,
   model: Model,
 ): ChatCompletionsPayload {
-  const ceiling = computeEffectiveCeiling(model)
+  const ceiling =
+    state.chatContextTrim ? computeEffectiveCeiling(model) : MAX_PAYLOAD_BYTES
   return fitPayloadToCeiling(payload, ceiling)
 }
 
@@ -159,8 +110,12 @@ function fitPayloadToCeiling(
   }
 
   consola.info(
-    `Context fit: payload ${formatBytes(initialBytes)} exceeds ${formatBytes(ceiling)} ceiling — reducing`,
+    `Context fit: payload ${formatBytes(initialBytes)} exceeds ${formatBytes(ceiling)} ceiling — ${state.chatContextTrim ? "reducing" : "requesting client compaction"}`,
   )
+
+  if (!state.chatContextTrim) {
+    throw createPromptTooLongError(payload, initialBytes, ceiling)
+  }
 
   // Slow path: progressive byte-based reduction.
   let current = pruneToolOutputs(payload)
@@ -206,6 +161,9 @@ function fitPayloadToCeiling(
   consola.warn(
     `Context fit: ${formatBytes(initialBytes)} → ${formatBytes(bytes)} after dropping old messages`,
   )
+  if (bytes > ceiling) {
+    throw createPromptTooLongError(payload, bytes, ceiling)
+  }
   return current
 }
 
@@ -217,24 +175,9 @@ function formatBytes(b: number): string {
 
 // ── Byte estimation ─────────────────────────────────────────────────────────
 
-/**
- * Cheap byte-size estimate for a payload. Uses content lengths directly
- * instead of JSON.stringify, which is ~10x faster on large payloads. The
- * estimate is a lower bound (ignores JSON framing overhead) but accurate
- * to within a few percent for realistic Claude Code payloads.
- */
+/** Actual serialized UTF-8 bytes, including JSON escaping and framing. */
 function estimatePayloadBytes(payload: ChatCompletionsPayload): number {
-  let bytes = 200 // baseline for top-level JSON framing
-  for (const msg of payload.messages) {
-    bytes += estimateMessageBytes(msg)
-  }
-  if (payload.tools) {
-    for (const tool of payload.tools) {
-      // Tool definitions are dense JSON; conservatively double-count via stringify.
-      bytes += JSON.stringify(tool).length + 20
-    }
-  }
-  return bytes
+  return Buffer.byteLength(JSON.stringify(payload), "utf8")
 }
 
 function estimateMessageBytes(msg: Message): number {

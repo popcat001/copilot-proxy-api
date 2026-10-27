@@ -2,6 +2,7 @@ import { afterEach, describe, expect, mock, test } from "bun:test"
 
 import type { Model, ModelsResponse } from "~/services/copilot/get-models"
 
+import { copilotHeaders } from "~/lib/api-config"
 import { state } from "~/lib/state"
 import { cacheModels } from "~/lib/utils"
 
@@ -41,6 +42,21 @@ function model(id: string): Model {
 }
 
 describe("cacheModels", () => {
+  test("uses the proposed API version only for model discovery", async () => {
+    const fetchMock = mock((_url: string, _options?: RequestInit) =>
+      Response.json({ object: "list", data: [model("claude-opus-5.5")] }),
+    )
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+    await cacheModels()
+    const headers = new Headers(fetchMock.mock.calls[0][1]?.headers)
+    expect(headers.get("x-github-api-version")).toBe("2026-08-01")
+    expect(copilotHeaders(state)["x-github-api-version"]).toBe("2025-04-01")
+    expect(state.models?.data[0].capabilities.limits).toEqual({
+      max_context_window_tokens: 1_000_000,
+      max_prompt_tokens: 936_000,
+      max_output_tokens: 64_000,
+    })
+  })
   test("does not advertise Opus 5 when Copilot omits it", async () => {
     const upstreamModels = {
       object: "list",

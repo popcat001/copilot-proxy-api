@@ -2,6 +2,7 @@ import consola from "consola"
 import { events } from "fetch-event-stream"
 
 import { copilotHeaders, copilotBaseUrl } from "~/lib/api-config"
+import { MAX_PAYLOAD_BYTES } from "~/lib/context-manager"
 import {
   copilotFetch,
   isLikelyContextOverflowTimeout,
@@ -35,8 +36,12 @@ export const createChatCompletions = async (
   }
 
   const body = JSON.stringify(requestPayload)
+  const bodyBytes = Buffer.byteLength(body, "utf8")
+  consola.info(
+    `Payload utilization (${requestPayload.model}): ${bodyBytes}/${MAX_PAYLOAD_BYTES} bytes (${((bodyBytes / MAX_PAYLOAD_BYTES) * 100).toFixed(1)}%)`,
+  )
   consola.debug(
-    `Sending payload: ${body.length} bytes, ${requestPayload.messages.length} messages, model: ${requestPayload.model}`,
+    `Sending payload: ${bodyBytes} bytes, ${requestPayload.messages.length} messages, model: ${requestPayload.model}`,
   )
 
   let response: Response
@@ -47,8 +52,8 @@ export const createChatCompletions = async (
       body,
     })
   } catch (error) {
-    if (isLikelyContextOverflowTimeout(error, body.length)) {
-      throw createPromptTooLongError(requestPayload, body.length)
+    if (isLikelyContextOverflowTimeout(error, bodyBytes)) {
+      throw createPromptTooLongError(requestPayload, bodyBytes)
     }
     throw error
   }
@@ -59,7 +64,7 @@ export const createChatCompletions = async (
       `Failed to create chat completions - Status: ${response.status} ${response.statusText}`,
     )
     consola.error(`Response body: ${errorBody}`)
-    consola.error(`Request payload size: ${body.length} bytes`)
+    consola.error(`Request payload size: ${bodyBytes} bytes`)
 
     // Detect context overflow errors. Includes:
     //  - HTTP 413 from Azure Front Door (>~5.4 MB)
@@ -72,12 +77,14 @@ export const createChatCompletions = async (
       || /request entity too large/i.test(errorBody)
       || /exceeds the limit of \d+/i.test(errorBody)
       || /context_length_exceeded/i.test(errorBody)
+      || /model_max_prompt_tokens_exceeded/i.test(errorBody)
+      || /prompt is too long/i.test(errorBody)
       || /operation timed out/i.test(errorBody)
       || /payload too large/i.test(errorBody)
       || /maximum context length/i.test(errorBody)
       || (response.status >= 500
         && response.status < 600
-        && body.length > 2_000_000)
+        && bodyBytes > 2_000_000)
 
     if (isContextOverflow) {
       // Return HTTP 400 with "prompt is too long" so Claude Code's reactive
@@ -94,7 +101,7 @@ export const createChatCompletions = async (
       // 168K for opus-4.7) rather than max_context_window_tokens (the
       // total window incl. output, ≥200K). Falling back to the larger field
       // and finally 200K preserves behavior for models lacking metadata.
-      throw createPromptTooLongError(requestPayload, body.length)
+      throw createPromptTooLongError(requestPayload, bodyBytes)
     }
 
     throw new HTTPError(

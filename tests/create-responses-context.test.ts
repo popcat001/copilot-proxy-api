@@ -2,6 +2,7 @@ import { afterEach, expect, mock, test } from "bun:test"
 
 import type { ResponsesApiRequest } from "~/routes/responses/types"
 
+import { HTTPError } from "~/lib/error"
 import { state } from "~/lib/state"
 import { createResponses } from "~/services/copilot/create-responses"
 
@@ -111,12 +112,14 @@ test("still enforces the hard transport ceiling without the flag", async () => {
   )
   globalThis.fetch = fetchMock as unknown as typeof fetch
 
-  await createResponses(payload)
-  const sentBody = bodyToString(fetchMock.mock.calls[0][1].body)
-
-  // Azure Front Door rejects above ~5.4 MB regardless of tokens, so this
-  // ceiling is a verified wire limit rather than an estimate.
-  expect(sentBody.length).toBeLessThanOrEqual(5_000_000)
+  const error = await createResponses(payload).catch(
+    (caught: unknown) => caught,
+  )
+  expect(error).toBeInstanceOf(HTTPError)
+  if (!(error instanceof HTTPError)) throw new Error("Expected HTTPError")
+  expect(error.response.status).toBe(400)
+  expect(await error.response.text()).toContain("prompt is too long")
+  expect(fetchMock).not.toHaveBeenCalled()
 })
 
 test("surfaces upstream token counts instead of a local estimate", async () => {

@@ -46,6 +46,20 @@ function cacheTestModels(): void {
 }
 
 describe("models route", () => {
+  test("preserves upstream 1M limits in the public catalog", async () => {
+    cacheTestModels()
+    const model = state.models?.data[0]
+    if (!model) throw new Error("Expected model")
+    model.id = "claude-opus-5.5"
+    model.capabilities.limits = {
+      max_context_window_tokens: 1_000_000,
+      max_prompt_tokens: 936_000,
+      max_output_tokens: 64_000,
+    }
+    const response = await createApp().request("/v1/models")
+    const body = (await response.json()) as ModelsResponse
+    expect(body.data[0].capabilities.limits).toEqual(model.capabilities.limits)
+  })
   test("generates Codex limits and effort from the selected Copilot model", async () => {
     cacheTestModels()
     const model = state.models?.data[0]

@@ -140,3 +140,23 @@ test("retries transient upstream 499 responses", async () => {
   expect(response).toMatchObject({ id: "123" })
   expect(fetchMock).toHaveBeenCalledTimes(2)
 })
+
+test("upstream prompt-token limit errors request client compaction", async () => {
+  const fetchMock = mock(() =>
+    Response.json(
+      {
+        error: { code: "model_max_prompt_tokens_exceeded" },
+      },
+      { status: 400 },
+    ),
+  )
+  globalThis.fetch = fetchMock as unknown as typeof fetch
+  const error = await createChatCompletions({
+    model: "claude-opus-5.5",
+    messages: [{ role: "user", content: "hello" }],
+  }).catch((caught: unknown) => caught)
+  expect(error).toBeInstanceOf(Error)
+  const response = (error as { response: Response }).response
+  expect(response.status).toBe(400)
+  expect(await response.text()).toContain("prompt is too long")
+})

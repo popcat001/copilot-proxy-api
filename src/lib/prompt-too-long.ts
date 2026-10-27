@@ -9,6 +9,7 @@ import { state } from "./state"
 export function createPromptTooLongError(
   payload: ChatCompletionsPayload,
   bodyLength: number,
+  payloadLimit?: number,
 ): HTTPError {
   const estimatedTokens = Math.ceil(bodyLength / 4)
   const modelCaps = state.models?.data.find((m) => m.id === payload.model)
@@ -17,9 +18,12 @@ export function createPromptTooLongError(
   const maxOutputTokens =
     payload.max_completion_tokens ?? payload.max_tokens ?? 0
 
-  consola.warn(
-    `Context overflow -> returning 400 prompt-too-long (~${estimatedTokens} + ${maxOutputTokens} > ${modelLimit}) to trigger Claude Code reactive compaction`,
-  )
+  const message =
+    payloadLimit ?
+      `prompt is too long: payload size ${bodyLength} bytes exceeds proxy limit of ${payloadLimit} bytes; compact the conversation and retry`
+    : `prompt is too long: input length and \`max_tokens\` exceed context limit: ${estimatedTokens} + ${maxOutputTokens} > ${modelLimit} tokens`
+
+  consola.warn(`${message} — returning 400 to request client compaction`)
 
   return new HTTPError(
     "Prompt too long",
@@ -28,7 +32,8 @@ export function createPromptTooLongError(
         type: "error",
         error: {
           type: "invalid_request_error",
-          message: `prompt is too long: input length and \`max_tokens\` exceed context limit: ${estimatedTokens} + ${maxOutputTokens} > ${modelLimit} tokens`,
+          code: "context_length_exceeded",
+          message,
         },
       }),
       {
@@ -38,4 +43,14 @@ export function createPromptTooLongError(
       },
     ),
   )
+}
+
+export function enforcePayloadLimit(
+  model: string,
+  bytes: number,
+  limit: number,
+): void {
+  if (bytes > limit) {
+    throw createPromptTooLongError({ model, messages: [] }, bytes, limit)
+  }
 }

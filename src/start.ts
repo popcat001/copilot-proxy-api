@@ -27,6 +27,7 @@ interface RunServerOptions {
   showToken: boolean
   proxyEnv: boolean
   apiKey?: string
+  chatContextTrim: boolean
   responsesContextTrim: boolean
 }
 
@@ -50,6 +51,7 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   state.rateLimitWait = options.rateLimitWait
   state.showToken = options.showToken
   state.localApiKeys = parseLocalApiKeys(options.apiKey)
+  state.chatContextTrim = options.chatContextTrim
   state.responsesContextTrim = options.responsesContextTrim
   if (state.responsesContextTrim) {
     consola.warn(
@@ -214,6 +216,12 @@ export const start = defineCommand({
       description:
         "Require one of these comma-separated local API keys for proxy routes",
     },
+    "chat-context-trim": {
+      type: "boolean",
+      default: false,
+      description:
+        "Opt in to lossy chat history trimming using an estimated token budget. Off by default — oversized requests ask the client to compact",
+    },
     "responses-context-trim": {
       type: "boolean",
       default: false,
@@ -238,6 +246,7 @@ export const start = defineCommand({
       showToken: args["show-token"],
       proxyEnv: args["proxy-env"],
       apiKey: args["api-key"],
+      chatContextTrim: args["chat-context-trim"],
       responsesContextTrim: args["responses-context-trim"],
     })
   },

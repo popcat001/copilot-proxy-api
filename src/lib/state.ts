@@ -13,6 +13,9 @@ export interface State {
   showToken: boolean
   localApiKeys: Array<string>
 
+  /** Opt in to lossy chat history reduction; otherwise ask the client to compact. */
+  chatContextTrim: boolean
+
   /**
    * Opt in to lossy pre-flight trimming of /responses history. Off by default:
    * the proxy forwards the client's conversation verbatim and lets Copilot
@@ -31,5 +34,6 @@ export const state: State = {
   rateLimitWait: false,
   showToken: false,
   localApiKeys: [],
+  chatContextTrim: false,
   responsesContextTrim: false,
 }

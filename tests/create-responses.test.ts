@@ -47,7 +47,8 @@ function bodyToString(body: unknown): string {
   return body
 }
 
-test("strips old Responses images when payload exceeds upstream byte limit", async () => {
+test("strips old Responses images with opt-in trimming when payload exceeds upstream byte limit", async () => {
+  state.responsesContextTrim = true
   const imageUrl = `data:image/png;base64,${"a".repeat(1_000_000)}`
   const payload: ResponsesApiRequest = {
     model: "unknown-vision-model",
@@ -746,7 +747,7 @@ test.each(["gpt-5.6-sol", "gpt-6-astra-2026-09-01"])(
 test("maps remaining upstream Responses 413 to prompt-too-long error", async () => {
   const payload: ResponsesApiRequest = {
     model: "gpt-5.5",
-    input: "x".repeat(5_100_000),
+    input: "hello",
     max_output_tokens: 1000,
   }
 

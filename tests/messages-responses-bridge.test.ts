@@ -36,6 +36,7 @@ const responsesNotebookTool = {
 afterEach(() => {
   mock.restore()
   state.models = undefined
+  state.chatContextTrim = false
 })
 
 function createApp(): Hono {
@@ -310,7 +311,8 @@ describe("Messages Responses bridge", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
-  test("fits large custom Claude Code aliases before forwarding to Copilot", async () => {
+  test("fits large custom Claude Code aliases with opt-in trimming", async () => {
+    state.chatContextTrim = true
     const app = createApp()
     const fetchMock = mock((_url: string, opts: RequestInit) => {
       const sentBody = opts.body as string

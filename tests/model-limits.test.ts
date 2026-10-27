@@ -44,16 +44,14 @@ describe("model limit helpers", () => {
     expect(getModelContextLimit("gpt-6.1-sol")).toBe(ONE_M_CONTEXT_TOKENS)
   })
 
-  test("uses 1m GPT-6.1 Sol limits before smaller metadata", () => {
+  test("prefers upstream GPT-6.1 Sol limits over fallbacks", () => {
     const limits = {
       max_context_window_tokens: 272_000,
       max_prompt_tokens: 272_000,
     }
 
-    expect(getModelPromptLimit("gpt-6.1-sol", limits)).toBe(ONE_M_PROMPT_TOKENS)
-    expect(getModelContextLimit("gpt-6.1-sol", limits)).toBe(
-      ONE_M_CONTEXT_TOKENS,
-    )
+    expect(getModelPromptLimit("gpt-6.1-sol", limits)).toBe(272_000)
+    expect(getModelContextLimit("gpt-6.1-sol", limits)).toBe(272_000)
   })
 
   test("uses default prompt limit for non-1m models without metadata", () => {

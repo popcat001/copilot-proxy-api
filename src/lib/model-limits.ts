@@ -23,22 +23,23 @@ export function getKnownModelPromptLimit(
   modelId: string,
   limits?: Model["capabilities"]["limits"],
 ): number | undefined {
+  if (limits?.max_prompt_tokens) return limits.max_prompt_tokens
+  if (limits?.max_context_window_tokens) return limits.max_context_window_tokens
   if (MODEL_PROMPT_TOKEN_OVERRIDES[modelId]) {
     return MODEL_PROMPT_TOKEN_OVERRIDES[modelId]
   }
-  if (limits?.max_prompt_tokens) return limits.max_prompt_tokens
   if (isOneMillionContextModel(modelId)) return ONE_M_PROMPT_TOKENS
-  return limits?.max_context_window_tokens
+  return undefined
 }
 
 export function getModelContextLimit(
   modelId: string,
   limits?: Model["capabilities"]["limits"],
 ): number {
+  if (limits?.max_context_window_tokens) return limits.max_context_window_tokens
   if (MODEL_CONTEXT_TOKEN_OVERRIDES[modelId]) {
     return MODEL_CONTEXT_TOKEN_OVERRIDES[modelId]
   }
-  if (limits?.max_context_window_tokens) return limits.max_context_window_tokens
   if (isOneMillionContextModel(modelId)) return ONE_M_CONTEXT_TOKENS
   return DEFAULT_PROMPT_TOKENS
 }

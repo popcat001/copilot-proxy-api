@@ -10,10 +10,12 @@ import { copilotBaseUrl, copilotHeaders } from "~/lib/api-config"
 import { wrapCancellableResponse } from "~/lib/cancellable-response"
 import { copilotFetch } from "~/lib/copilot-fetch"
 import { HTTPError } from "~/lib/error"
+import { getModelPromptLimit } from "~/lib/model-limits"
+import { enforcePayloadLimit } from "~/lib/prompt-too-long"
 import {
-  getKnownModelPromptLimit,
-  getModelPromptLimit,
-} from "~/lib/model-limits"
+  computeResponsesPayloadCeiling,
+  MAX_RESPONSES_PAYLOAD_BYTES,
+} from "~/lib/responses-context-limit"
 import { state } from "~/lib/state"
 import {
   createEncryptedOutputScope,
@@ -25,31 +27,6 @@ import {
 } from "~/services/copilot/encrypted-output-recovery"
 import { validateResponsesCapabilities } from "~/services/copilot/responses-capabilities"
 
-/**
- * Hard transport ceiling. Azure Front Door rejects bodies above ~5.4 MB before
- * Copilot ever sees them, so trimming to stay under this is not a guess about
- * token accounting — it is a verified wire limit. Enforced unconditionally.
- */
-const MAX_RESPONSES_PAYLOAD_BYTES = 5_000_000
-
-/**
- * Bytes per token for Responses payloads, used only when opt-in token-derived
- * trimming is enabled.
- *
- * Measured against multi-turn payloads built from this repository's own source
- * (user messages, function_call items, large function_call_output bodies,
- * assistant replies): 4.4 JSON bytes per content token, 3.7 per token of the
- * serialized JSON itself. The previous value of 3.5 was inherited from
- * context-manager.ts, where it measures *unescaped content length* rather than
- * serialized JSON — copying the constant silently changed its basis and made
- * the derived ceiling ~26% too aggressive, engaging trimming at roughly 77% of
- * a model's real window.
- *
- * 4.3 is the conservative end of what was measured. Neither figure is Copilot's
- * own prompt-token count, which is why this no longer gates the default path.
- */
-const CHARS_PER_TOKEN_ESTIMATE = 4.3
-const TOKEN_RESERVE = 8_000
 const IMAGE_STRIPPED_PLACEHOLDER =
   "[image removed to stay under upstream payload limit]"
 const INVALID_OUTPUT_IMAGE_PLACEHOLDER =
@@ -94,21 +71,12 @@ export async function createResponses(
     (fingerprint) =>
       isRejectedEncryptedOutput(encryptedOutputScope, fingerprint),
   )
-  const upstreamPayload = fitResponsesPayload(
-    knownRejected.payload,
-    computeResponsesPayloadCeiling(payload.model),
-  )
+  const upstreamPayload = prepareResponsesPayload(knownRejected.payload)
   const headers: Record<string, string> = {
     ...copilotHeaders(state, responsesPayloadHasImages(upstreamPayload)),
     accept: upstreamPayload.stream ? "text/event-stream" : "application/json",
     "X-Initiator": "agent",
   }
-  const bodyLength = JSON.stringify(upstreamPayload).length
-
-  consola.debug(
-    `Sending responses payload: ${bodyLength} bytes, model: ${payload.model}`,
-  )
-
   const result = await fetchResponsesWithEncryptedOutputFallback(
     { url, headers, encryptedOutputScope, signal: upstreamSignal },
     upstreamPayload,
@@ -121,9 +89,12 @@ export async function createResponses(
       `Failed to create responses - Status: ${response.status} ${response.statusText}`,
     )
     consola.error(`Response body: ${errorBody}`)
-    consola.error(`Request payload size: ${result.body.length} bytes`)
+    consola.error(
+      `Request payload size: ${Buffer.byteLength(result.body, "utf8")} bytes`,
+    )
 
-    if (isContextOverflow(response, errorBody, result.body.length)) {
+    const responseBytes = Buffer.byteLength(result.body, "utf8")
+    if (isContextOverflow(response, errorBody, responseBytes)) {
       const modelCaps = state.models?.data.find((m) => m.id === payload.model)
         ?.capabilities.limits
       const maxOutputTokens = payload.max_output_tokens ?? 0
@@ -133,7 +104,7 @@ export async function createResponses(
       // a bytes/4 guess for upstream's real count makes it compact by the wrong
       // amount. Fall back to the estimate only when upstream gave us nothing.
       const upstream = parseUpstreamTokenCounts(errorBody)
-      const estimatedTokens = upstream.used ?? Math.ceil(result.body.length / 4)
+      const estimatedTokens = upstream.used ?? Math.ceil(responseBytes / 4)
       const modelLimit =
         upstream.limit ?? getModelPromptLimit(payload.model, modelCaps)
       const source = upstream.used ? "upstream-reported" : "estimated"
@@ -267,12 +238,29 @@ async function sendResponsesRequest(
   return { body, errorBody, response }
 }
 
+function prepareResponsesPayload(
+  payload: ResponsesApiRequest,
+): ResponsesApiRequest {
+  const ceiling = computeResponsesPayloadCeiling(payload.model)
+  const fitted = fitResponsesPayload(payload, ceiling)
+  const bytes = Buffer.byteLength(JSON.stringify(fitted), "utf8")
+  enforcePayloadLimit(payload.model, bytes, ceiling)
+  consola.info(
+    `Payload utilization (${payload.model}): ${bytes}/${MAX_RESPONSES_PAYLOAD_BYTES} bytes (${((bytes / MAX_RESPONSES_PAYLOAD_BYTES) * 100).toFixed(1)}%)`,
+  )
+  return fitted
+}
+
 function fitResponsesPayload(
   payload: ResponsesApiRequest,
   ceiling: number,
 ): ResponsesApiRequest {
   const initialBody = JSON.stringify(payload)
-  if (initialBody.length <= ceiling) return payload
+  const initialBytes = Buffer.byteLength(initialBody, "utf8")
+  if (initialBytes <= ceiling) return payload
+  if (!state.responsesContextTrim) {
+    enforcePayloadLimit(payload.model, initialBytes, ceiling)
+  }
 
   consola.info(
     `Responses context fit: payload ${initialBody.length} bytes exceeds ${ceiling} byte ceiling - reducing`,
@@ -342,33 +330,6 @@ function fitResponsesPayload(
   )
 
   return current
-}
-
-/**
- * Byte ceiling for the forwarded payload.
- *
- * By default this is the transport ceiling alone: the proxy forwards the
- * client's history verbatim and lets Copilot enforce its own token limits, so
- * a rejection is upstream's real answer rather than a local guess. Rewriting
- * history pre-emptively both discards context Copilot would have accepted and
- * breaks prompt-cache continuity, because `dropOldInputItems` rewrites from the
- * oldest item forward — exactly the stable prefix a cache is keyed on.
- *
- * With `responsesContextTrim` enabled, the smaller token-derived ceiling is
- * applied too, restoring the previous lossy behavior for anyone who wants it.
- */
-function computeResponsesPayloadCeiling(modelId: string): number {
-  if (!state.responsesContextTrim) return MAX_RESPONSES_PAYLOAD_BYTES
-
-  const limits = state.models?.data.find((m) => m.id === modelId)?.capabilities
-    .limits
-  const maxPromptTokens = getKnownModelPromptLimit(modelId, limits)
-  if (!maxPromptTokens) return MAX_RESPONSES_PAYLOAD_BYTES
-
-  const tokenDerivedBytes = Math.floor(
-    (maxPromptTokens - TOKEN_RESERVE) * CHARS_PER_TOKEN_ESTIMATE,
-  )
-  return Math.min(MAX_RESPONSES_PAYLOAD_BYTES, tokenDerivedBytes)
 }
 
 function truncateStringInput(

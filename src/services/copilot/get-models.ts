@@ -4,7 +4,10 @@ import { state } from "~/lib/state"
 
 export const getModels = async () => {
   const response = await fetch(`${copilotBaseUrl(state)}/models`, {
-    headers: copilotHeaders(state),
+    headers: {
+      ...copilotHeaders(state),
+      "x-github-api-version": "2026-08-01",
+    },
   })
 
   if (!response.ok) throw new HTTPError("Failed to get models", response)
